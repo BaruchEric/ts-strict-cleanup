@@ -3,7 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
-import { glob } from 'glob';
+import { detectPackageRunner } from '../utils/detectPackageRunner.js';
 
 const FIX_STRATEGIES = {
   'void-expressions': {
@@ -46,25 +46,47 @@ export async function fixCommand(type, options) {
   let totalFixed = 0;
   let totalFiles = 0;
 
+  // Detect package runner
+  const packageRunner = await detectPackageRunner(cwd);
+
+  // Load analysis to get directories
+  const analysisPath = path.resolve(cwd, '.ts-strict-cleanup.json');
+  let directories = ['src'];
+  if (await fs.pathExists(analysisPath)) {
+    const analysis = await fs.readJson(analysisPath);
+    directories = Object.keys(analysis.directories || {});
+  }
+
   for (const fixType of fixTypes) {
     const strategy = FIX_STRATEGIES[fixType];
     const spinner = ora(`Fixing ${fixType}...`).start();
 
     try {
-      // Get files with this error type
-      const { stdout: listOutput } = await execa(
-        'npx',
-        ['eslint', 'src/', 'convex/', '--format', 'json'],
-        { cwd, reject: false }
-      );
-
-      const results = JSON.parse(listOutput || '[]');
+      // Get files with this error type (process directories separately to avoid OOM)
       const filesWithError = new Set();
 
-      for (const result of results) {
-        const hasError = result.messages.some((msg) => msg.ruleId === strategy.rule);
-        if (hasError) {
-          filesWithError.add(result.filePath);
+      for (const dir of directories) {
+        try {
+          const { stdout: listOutput } = await execa(
+            packageRunner,
+            ['eslint', dir, '--format', 'json'],
+            { cwd, reject: false }
+          );
+
+          // Parse JSON output
+          const jsonOutput = listOutput.split('\n').find(line => line.trim().startsWith('['));
+          if (jsonOutput) {
+            const results = JSON.parse(jsonOutput);
+
+            for (const result of results) {
+              const hasError = result.messages.some((msg) => msg.ruleId === strategy.rule);
+              if (hasError) {
+                filesWithError.add(result.filePath);
+              }
+            }
+          }
+        } catch (dirError) {
+          // Continue with other directories
         }
       }
 
@@ -89,7 +111,7 @@ export async function fixCommand(type, options) {
         } else {
           // Run ESLint --fix on batch
           await execa(
-            'npx',
+            packageRunner,
             ['eslint', ...batch, '--fix', '--quiet'],
             { cwd, reject: false }
           );
@@ -99,17 +121,27 @@ export async function fixCommand(type, options) {
         spinner.text = `Fixing ${fixType}: ${filesFixed}/${files.length} files`;
       }
 
-      // Count remaining errors
-      const { stdout: afterOutput } = await execa(
-        'npx',
-        ['eslint', 'src/', 'convex/', '--format', 'json'],
-        { cwd, reject: false }
-      );
+      // Count remaining errors (check each directory separately)
+      let remainingErrors = 0;
+      for (const dir of directories) {
+        try {
+          const { stdout: afterOutput } = await execa(
+            packageRunner,
+            ['eslint', dir, '--format', 'json'],
+            { cwd, reject: false }
+          );
 
-      const afterResults = JSON.parse(afterOutput || '[]');
-      const remainingErrors = afterResults.reduce((sum, result) => {
-        return sum + result.messages.filter((msg) => msg.ruleId === strategy.rule).length;
-      }, 0);
+          const jsonOutput = afterOutput.split('\n').find(line => line.trim().startsWith('['));
+          if (jsonOutput) {
+            const afterResults = JSON.parse(jsonOutput);
+            remainingErrors += afterResults.reduce((sum, result) => {
+              return sum + result.messages.filter((msg) => msg.ruleId === strategy.rule).length;
+            }, 0);
+          }
+        } catch {
+          // Continue
+        }
+      }
 
       const errorsFixed = filesWithError.size > 0 ? '✓' : remainingErrors;
       spinner.succeed(

@@ -3,6 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
+import { detectPackageRunner } from '../utils/detectPackageRunner.js';
 
 export async function statusCommand(options) {
   const cwd = process.cwd();
@@ -21,24 +22,41 @@ export async function statusCommand(options) {
     const analysis = await fs.readJson(analysisFile);
     const baseline = analysis.baseline;
     const baselineDate = new Date(analysis.timestamp).toLocaleDateString();
+    const directories = Object.keys(analysis.directories || {});
 
-    // Get current error count
-    const { stdout } = await execa(
-      'npx',
-      ['eslint', 'src/', 'convex/', '--format', 'json'],
-      { cwd, reject: false }
-    );
+    // Detect package runner
+    const packageRunner = await detectPackageRunner(cwd);
 
-    const results = JSON.parse(stdout || '[]');
+    // Get current error count (process directories separately to avoid OOM)
     const currentErrors = {};
     let currentTotal = 0;
 
-    for (const result of results) {
-      for (const message of result.messages) {
-        if (message.ruleId) {
-          currentErrors[message.ruleId] = (currentErrors[message.ruleId] || 0) + 1;
-          currentTotal++;
+    for (const dir of directories) {
+      spinner.text = `Checking ${dir}...`;
+
+      try {
+        const { stdout } = await execa(
+          packageRunner,
+          ['eslint', dir, '--format', 'json'],
+          { cwd, reject: false }
+        );
+
+        // Parse JSON output
+        const jsonOutput = stdout.split('\n').find(line => line.trim().startsWith('['));
+        if (jsonOutput) {
+          const results = JSON.parse(jsonOutput);
+
+          for (const result of results) {
+            for (const message of result.messages) {
+              if (message.ruleId) {
+                currentErrors[message.ruleId] = (currentErrors[message.ruleId] || 0) + 1;
+                currentTotal++;
+              }
+            }
+          }
         }
+      } catch (dirError) {
+        // Continue with other directories
       }
     }
 

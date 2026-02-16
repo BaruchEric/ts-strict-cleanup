@@ -3,6 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
+import { detectPackageRunner } from '../utils/detectPackageRunner.js';
 
 export async function analyzeCommand(options) {
   const spinner = ora('Analyzing TypeScript project...').start();
@@ -14,15 +15,45 @@ export async function analyzeCommand(options) {
       directories.push(options.convex);
     }
 
-    // Run ESLint to get all errors
-    spinner.text = 'Running ESLint...';
-    const { stdout } = await execa(
-      'npx',
-      ['eslint', ...directories, '--format', 'json'],
-      { cwd, reject: false }
-    );
+    // Detect which package runner to use (bunx or npx)
+    const packageRunner = await detectPackageRunner(cwd);
+    if (packageRunner === 'bunx') {
+      spinner.text = 'Detected bun project, using bunx...';
+    }
 
-    const results = JSON.parse(stdout || '[]');
+    // Run ESLint on each directory separately to avoid OOM issues
+    let results = [];
+    for (const dir of directories) {
+      spinner.text = `Running ESLint on ${dir}...`;
+
+      try {
+        const { stdout, stderr } = await execa(
+          packageRunner,
+          ['eslint', dir, '--format', 'json'],
+          {
+            cwd,
+            reject: false,
+            // Filter out stderr noise (warnings, deprecation messages)
+            // but keep actual errors
+          }
+        );
+
+        // Parse results (ESLint writes JSON to stdout even on errors)
+        try {
+          // Filter out non-JSON lines (warnings, deprecation notices)
+          const jsonOutput = stdout.split('\n').find(line => line.trim().startsWith('['));
+          if (jsonOutput) {
+            const dirResults = JSON.parse(jsonOutput);
+            results = results.concat(dirResults);
+          }
+        } catch (parseError) {
+          spinner.warn(`Failed to parse ESLint output for ${dir}`);
+          console.error(chalk.yellow(`  Stdout (first 300 chars): ${stdout.substring(0, 300)}`));
+        }
+      } catch (execError) {
+        spinner.warn(`ESLint failed for ${dir}: ${execError.message}`);
+      }
+    }
 
     // Categorize errors
     const errorCounts = {};
